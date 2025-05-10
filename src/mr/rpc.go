@@ -6,8 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
@@ -24,6 +26,33 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+// 表示当前job的状态
+type JobCondition int
+
+const (
+	JobWorking = iota
+	JobWaiting
+	JobDone
+)
+
+// 表示当前job的种类
+type JobType int
+
+const (
+	MapJob = iota
+	ReduceJob
+	WaittingJob
+	KillJob
+)
+
+// 当前协调器的状态
+type Condition int
+
+const (
+	MapPhase = iota
+	ReducePhase
+	AllDone
+)
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

@@ -19,7 +19,13 @@ then
   fi
 fi
 
-ISQUIET=$1
+# 默认为quiet模式，只显示摘要输出
+ISQUIET="quiet"
+# 如果传入verbose参数，则显示详细输出
+if [ "$1" == "verbose" ]; then
+  ISQUIET=""
+fi
+
 maybe_quiet() {
     if [ "$ISQUIET" == "quiet" ]; then
       "$@" > /dev/null 2>&1
