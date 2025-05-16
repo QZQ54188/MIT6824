@@ -63,9 +63,9 @@ type Entry struct {
 }
 
 const (
-	HeartBeatTimeOut          = 150                                   // 心跳重传时间
-	ElectTimeOutBase          = 500                                   // 选举超时时间
-	ElectTimeOutCheckInterval = time.Duration(300) * time.Millisecond // 检查是否超时的间隔
+	HeartBeatTimeOut          = 101                                   // 心跳重传时间
+	ElectTimeOutBase          = 450                                   // 选举超时时间
+	ElectTimeOutCheckInterval = time.Duration(250) * time.Millisecond // 检查是否超时的间隔
 	CommitCheckTimeInterval   = time.Duration(100) * time.Millisecond // 检查是否可以commit的间隔
 )
 
@@ -92,6 +92,7 @@ type Raft struct {
 	muVote      sync.Mutex    // 保护投票数据，用于细化锁粒度
 	timeStamp   time.Time     // 记录收到心跳的时间
 	applyCh     chan ApplyMsg // 向上层应用传递消息的管道
+	applyCond   *sync.Cond    // 用于通知有新的日志可以应用
 }
 
 // return currentTerm and whether this server
@@ -194,7 +195,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.state = Follower
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		if args.Term > rf.log[len(rf.log)-1].Term || (args.LastLogIndex >= len(rf.log)-1 && args.LastLogTerm >= rf.log[len(rf.log)-1].Term) {
+		if args.LastLogTerm > rf.log[len(rf.log)-1].Term ||
+			(args.LastLogTerm == rf.log[len(rf.log)-1].Term) && args.LastLogIndex >= len(rf.log)-1 {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 			rf.state = Follower
@@ -340,7 +342,7 @@ func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs) {
 			return
 		}
 		rf.state = Leader
-		// 需要重新初始化nextIndex和matchIndex
+		// 成为Leader之后需要重新初始化nextIndex和matchIndex
 		for i := 0; i < len(rf.nextIndex); i++ {
 			rf.nextIndex[i] = len(rf.log)
 			rf.matchIndex[i] = 0
@@ -384,6 +386,7 @@ func (rf *Raft) ticker() {
 		rf.mu.Lock()
 		if rf.state != Leader && time.Since(rf.timeStamp) > time.Duration(rdTimeOut)*time.Millisecond {
 			// 超时
+			DPrintf("server %v 选举超时，进行选举", rf.me)
 			go rf.Elect()
 		}
 		rf.mu.Unlock()
@@ -410,9 +413,21 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) CommitChecker() {
-	// 检查是否有新的commit
+	// 使用条件变量等待新的commit而不是轮询
 	for !rf.killed() {
 		rf.mu.Lock()
+
+		// 当没有新日志可应用时，等待条件变量通知
+		for rf.commitIndex <= rf.lastApplied && !rf.killed() {
+			rf.applyCond.Wait() // 等待通知
+		}
+
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+
+		// 有新日志需要应用
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied += 1
 			msg := &ApplyMsg{
@@ -420,17 +435,22 @@ func (rf *Raft) CommitChecker() {
 				Command:      rf.log[rf.lastApplied].Cmd,
 				CommandIndex: rf.lastApplied,
 			}
+			// 需要在释放锁的情况下发送消息，避免死锁
+			rf.mu.Unlock()
 			rf.applyCh <- *msg
-			DPrintf("server %v 准备将命令 %v(索引为 %v ) 应用到状态机\n", rf.me, msg.Command, msg.CommandIndex)
+			DPrintf("server %v 准备将(索引为 %v ) 应用到状态机\n", rf.me, msg.CommandIndex)
+			rf.mu.Lock()
 		}
+
 		rf.mu.Unlock()
-		time.Sleep(CommitCheckTimeInterval)
 	}
 }
 
 // 处理AppendEntries RPC（心跳）
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+
+	rf.timeStamp = time.Now()
 
 	if args.Term < rf.currentTerm {
 		// 这是来自旧Leader的消息或者当前节点是一个孤立节点，
@@ -441,7 +461,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.timeStamp = time.Now()
 	if args.Term > rf.currentTerm {
 		// 新Leader的第一条消息
 		rf.currentTerm = args.Term
@@ -453,7 +472,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//心跳函数
 		DPrintf("server %v 接收到 leader &%v 的心跳\n", rf.me, args.LeaderId)
 	} else {
-		DPrintf("server %v 收到 leader %v 的的AppendEntries: %+v \n", rf.me, args.LeaderId, args)
+		// DPrintf("server %v 收到 leader %v 的的AppendEntries: %+v \n", rf.me, args.LeaderId, args)
+		DPrintf("server %v 收到 leader %v 的的AppendEntries\n", rf.me, args.LeaderId)
 	}
 	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		// PrevLogIndex和PrevLogTerm不合法
@@ -485,7 +505,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 根据Leader中的提交信息更新当前节点的提交信息
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
+		rf.applyCond.Signal() // 通知可能有新的日志需要应用
 	}
+
 	rf.mu.Unlock()
 }
 
@@ -528,6 +550,8 @@ func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
 			if count > len(rf.peers)/2 {
 				// 如果至少一半的follower回复了成功, 更新commitIndex
 				rf.commitIndex = n
+				rf.applyCond.Signal() // 通知可能有新的日志需要应用
+				DPrintf("server %v 的提交索引被设置为 %v", rf.me, rf.commitIndex)
 				break
 			}
 			n -= 1
@@ -581,6 +605,7 @@ func (rf *Raft) sendHeartbeats() {
 			if len(rf.log)-1 >= rf.nextIndex[i] {
 				// 如果有新的log需要发送，则就是一个真正的AppendEntries而不是心跳
 				args.Entries = rf.log[rf.nextIndex[i]:]
+				// DPrintf("leader %v 开始向 server %v 广播新的AppendEntries: %+v\n", rf.me, i, args.Entries)
 				DPrintf("leader %v 开始向 server %v 广播新的AppendEntries\n", rf.me, i)
 			} else {
 				// 如果没有新的log发送，就发送一个长度为0的切片表示心跳
@@ -624,12 +649,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	rf.timeStamp = time.Now()
+	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu) // 初始化条件变量，关联到rf.mu锁
+
+	for i := 0; i < len(rf.nextIndex); i++ {
+		rf.nextIndex[i] = 1
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	// 为每个raft节点开启一个向上层应用提交日志的协程
+	go rf.CommitChecker()
 
 	return rf
 }

@@ -8,20 +8,24 @@ package raft
 // test with the original before submitting.
 //
 
-import "6.5840/labgob"
-import "6.5840/labrpc"
-import "bytes"
-import "log"
-import "sync"
-import "sync/atomic"
-import "testing"
-import "runtime"
-import "math/rand"
-import crand "crypto/rand"
-import "math/big"
-import "encoding/base64"
-import "time"
-import "fmt"
+import (
+	"bytes"
+	"log"
+	"math/rand"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"math/big"
+	"time"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -107,6 +111,7 @@ func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
 
 // shut down a Raft server but save its persistent state.
 func (cfg *config) crash1(i int) {
+	// fmt.Printf("服务器崩溃! 服务器 %d 已崩溃\n", i)
 	cfg.disconnect(i)
 	cfg.net.DeleteServer(i) // disable client connections to the server.
 
@@ -327,6 +332,8 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	srv := labrpc.MakeServer()
 	srv.AddService(svc)
 	cfg.net.AddServer(i, srv)
+
+	// fmt.Printf("服务器启动! 服务器 %d 已重新启动并加入集群\n", i)
 }
 
 func (cfg *config) checkTimeout() {
@@ -355,6 +362,7 @@ func (cfg *config) cleanup() {
 // attach server i to the net.
 func (cfg *config) connect(i int) {
 	// fmt.Printf("connect(%d)\n", i)
+	fmt.Printf("网络恢复! 重新连接服务器 %d\n", i)
 
 	cfg.connected[i] = true
 
@@ -378,6 +386,7 @@ func (cfg *config) connect(i int) {
 // detach server i from the net.
 func (cfg *config) disconnect(i int) {
 	// fmt.Printf("disconnect(%d)\n", i)
+	fmt.Printf("网络断开! 断开服务器 %d 的连接\n", i)
 
 	cfg.connected[i] = false
 
