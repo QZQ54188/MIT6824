@@ -63,10 +63,8 @@ type Entry struct {
 }
 
 const (
-	HeartBeatTimeOut          = 101                                   // 心跳重传时间
-	ElectTimeOutBase          = 450                                   // 选举超时时间
-	ElectTimeOutCheckInterval = time.Duration(250) * time.Millisecond // 检查是否超时的间隔
-	CommitCheckTimeInterval   = time.Duration(100) * time.Millisecond // 检查是否可以commit的间隔
+	HeartBeatTimeOut = 101 // 心跳重传时间
+	ElectTimeOutBase = 450 // 选举超时时间
 )
 
 // A Go object implementing a single Raft peer.
@@ -80,17 +78,18 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state       int           // 当前raft节点的状态(follow,candidate,leader)
-	currentTerm int           //当前raft节点的任期
-	votedFor    int           //该节点把票投给了谁
-	voteCount   int           // 当前term收到的票数
-	log         []Entry       // 存储的日志
-	commitIndex int           // 提交日志的索引
-	lastApplied int           // 给上层应用日志的索引
-	nextIndex   []int         // 发给 follower[i] 的下一条日志索引
-	matchIndex  []int         // follower[i] 已复制的最大日志索引
-	muVote      sync.Mutex    // 保护投票数据，用于细化锁粒度
-	timeStamp   time.Time     // 记录收到心跳的时间
+	state       int        // 当前raft节点的状态(follow,candidate,leader)
+	currentTerm int        //当前raft节点的任期
+	votedFor    int        //该节点把票投给了谁
+	voteCount   int        // 当前term收到的票数
+	log         []Entry    // 存储的日志
+	commitIndex int        // 提交日志的索引
+	lastApplied int        // 给上层应用日志的索引
+	nextIndex   []int      // 发给 follower[i] 的下一条日志索引
+	matchIndex  []int      // follower[i] 已复制的最大日志索引
+	muVote      sync.Mutex // 保护投票数据，用于细化锁粒度
+	timer       *time.Timer
+	rd          *rand.Rand
 	applyCh     chan ApplyMsg // 向上层应用传递消息的管道
 	applyCond   *sync.Cond    // 用于通知有新的日志可以应用
 }
@@ -200,16 +199,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 			rf.state = Follower
-			rf.timeStamp = time.Now()
+			rf.ResetTimer()
 
 			reply.Term = rf.currentTerm
 			rf.mu.Unlock()
 			reply.VoteGranted = true
 			DPrintf("server %v 同意向 server %v投票\n\targs= %+v\n", rf.me, args.CandidateId, args)
 			return
+		} else {
+			if args.LastLogTerm < rf.log[len(rf.log)-1].Term {
+				DPrintf("server %v 拒绝向 server %v 投票: 更旧的LastLogTerm, args = %+v\n", rf.me, args.CandidateId, args)
+			} else {
+				DPrintf("server %v 拒绝向 server %v 投票: 更短的Log, args = %+v\n", rf.me, args.CandidateId, args)
+			}
 		}
 	} else {
-		DPrintf("server %v 拒绝向 server %v投票: 已投票\n\targs= %+v\n", rf.me, args.CandidateId, args)
+		DPrintf("server %v 拒绝向 server %v投票: 已投票, args = %+v\n", rf.me, args.CandidateId, args)
 	}
 
 	reply.Term = rf.currentTerm
@@ -293,6 +298,11 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) ResetTimer() {
+	rdTimeOut := GetRandomElectTimeOut(rf.rd)
+	rf.timer.Reset(time.Duration(rdTimeOut) * time.Millisecond)
+}
+
 func (rf *Raft) GetVoteAnswer(server int, args *RequestVoteArgs) bool {
 	sendArgs := *args
 	reply := RequestVoteReply{}
@@ -357,11 +367,11 @@ func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs) {
 func (rf *Raft) Elect() {
 	rf.mu.Lock()
 
-	rf.currentTerm += 1       // 自增term
-	rf.state = Candidate      // 成为候选人
-	rf.votedFor = rf.me       // 给自己投票
-	rf.voteCount = 1          // 自己有一票
-	rf.timeStamp = time.Now() // 自己给自己投票也算一种消息
+	rf.currentTerm += 1  // 自增term
+	rf.state = Candidate // 成为候选人
+	rf.votedFor = rf.me  // 给自己投票
+	rf.voteCount = 1     // 自己有一票
+	// rf.timeStamp = time.Now() // 自己给自己投票也算一种消息
 
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -380,17 +390,14 @@ func (rf *Raft) Elect() {
 }
 
 func (rf *Raft) ticker() {
-	rd := rand.New(rand.NewSource(int64(rf.me)))
 	for !rf.killed() {
-		rdTimeOut := GetRandomElectTimeOut(rd)
+		<-rf.timer.C
 		rf.mu.Lock()
-		if rf.state != Leader && time.Since(rf.timeStamp) > time.Duration(rdTimeOut)*time.Millisecond {
-			// 超时
-			DPrintf("server %v 选举超时，进行选举", rf.me)
+		if rf.state != Leader {
 			go rf.Elect()
 		}
+		rf.ResetTimer()
 		rf.mu.Unlock()
-		time.Sleep(ElectTimeOutCheckInterval)
 	}
 }
 
@@ -436,10 +443,8 @@ func (rf *Raft) CommitChecker() {
 				CommandIndex: rf.lastApplied,
 			}
 			// 需要在释放锁的情况下发送消息，避免死锁
-			rf.mu.Unlock()
 			rf.applyCh <- *msg
 			DPrintf("server %v 准备将(索引为 %v ) 应用到状态机\n", rf.me, msg.CommandIndex)
-			rf.mu.Lock()
 		}
 
 		rf.mu.Unlock()
@@ -450,16 +455,17 @@ func (rf *Raft) CommitChecker() {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 
-	rf.timeStamp = time.Now()
-
 	if args.Term < rf.currentTerm {
 		// 这是来自旧Leader的消息或者当前节点是一个孤立节点，
 		// 因为持续增加 currentTerm 进行选举, 因此真正的leader返回了更旧的term
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
 		reply.Success = false
+		DPrintf("server %v 收到了旧的leader% v 的心跳函数, args=%+v, 更新的term: %v\n", rf.me, args.LeaderId, args, reply.Term)
 		return
 	}
+
+	rf.ResetTimer()
 
 	if args.Term > rf.currentTerm {
 		// 新Leader的第一条消息
@@ -548,14 +554,14 @@ func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
 			}
 
 			if count > len(rf.peers)/2 {
-				// 如果至少一半的follower回复了成功, 更新commitIndex
-				rf.commitIndex = n
-				rf.applyCond.Signal() // 通知可能有新的日志需要应用
-				DPrintf("server %v 的提交索引被设置为 %v", rf.me, rf.commitIndex)
 				break
 			}
 			n -= 1
 		}
+		// 如果至少一半的follower回复了成功, 更新commitIndex
+		rf.commitIndex = n
+		rf.applyCond.Signal() // 通知可能有新的日志需要应用
+		DPrintf("server %v 的提交索引被设置为 %v", rf.me, rf.commitIndex)
 		rf.mu.Unlock()
 		return
 	}
@@ -566,7 +572,7 @@ func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
 		rf.currentTerm = reply.Term
 		rf.state = Follower
 		rf.votedFor = -1
-		rf.timeStamp = time.Now()
+		rf.ResetTimer()
 		rf.mu.Unlock()
 		return
 	}
@@ -648,9 +654,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = append(rf.log, Entry{Term: 0})
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
-	rf.timeStamp = time.Now()
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu) // 初始化条件变量，关联到rf.mu锁
+	rf.rd = rand.New(rand.NewSource(int64(rf.me)))
+	rf.timer = time.NewTimer(0)
+	rf.ResetTimer()
 
 	for i := 0; i < len(rf.nextIndex); i++ {
 		rf.nextIndex[i] = 1
