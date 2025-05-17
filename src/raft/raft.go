@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math"
 	"math/rand"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -124,6 +126,15 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	DPrintf("server %v 开始持久化", rf.me)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -144,6 +155,24 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	if data == nil || len(data) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var voteFor int
+	var currentTerm int
+	var log []Entry
+	if d.Decode(&voteFor) != nil ||
+		d.Decode(&currentTerm) != nil ||
+		d.Decode(&log) != nil {
+		DPrintf("readPersist failed\n")
+	} else {
+		rf.votedFor = voteFor
+		rf.currentTerm = currentTerm
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -192,6 +221,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 		rf.currentTerm = args.Term
 		rf.state = Follower
+		rf.persist()
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		if args.LastLogTerm > rf.log[len(rf.log)-1].Term ||
@@ -200,6 +230,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateId
 			rf.state = Follower
 			rf.ResetTimer()
+			rf.persist()
 
 			reply.Term = rf.currentTerm
 			rf.mu.Unlock()
@@ -276,6 +307,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	newEntry := &Entry{Term: rf.currentTerm, Cmd: command}
 	rf.log = append(rf.log, *newEntry)
+	rf.persist()
 	return len(rf.log) - 1, rf.currentTerm, true
 }
 
@@ -324,6 +356,7 @@ func (rf *Raft) GetVoteAnswer(server int, args *RequestVoteArgs) bool {
 		rf.state = Follower
 		rf.votedFor = -1
 		rf.currentTerm = reply.Term
+		rf.persist()
 	}
 	return reply.VoteGranted
 }
@@ -371,6 +404,7 @@ func (rf *Raft) Elect() {
 	rf.state = Candidate // 成为候选人
 	rf.votedFor = rf.me  // 给自己投票
 	rf.voteCount = 1     // 自己有一票
+	rf.persist()
 	// rf.timeStamp = time.Now() // 自己给自己投票也算一种消息
 
 	args := &RequestVoteArgs{
@@ -417,6 +451,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  //回复raft节点的任期
 	Success bool //是否成功收到raft节点的确认
+	XTerm   int  //follower中与leader冲突的log对应的Term
+	XIndex  int  //冲突的任期的第一条日志
+	XLen    int  //follower中log的长度
 }
 
 func (rf *Raft) CommitChecker() {
@@ -454,12 +491,12 @@ func (rf *Raft) CommitChecker() {
 // 处理AppendEntries RPC（心跳）
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	if args.Term < rf.currentTerm {
 		// 这是来自旧Leader的消息或者当前节点是一个孤立节点，
 		// 因为持续增加 currentTerm 进行选举, 因此真正的leader返回了更旧的term
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		reply.Success = false
 		DPrintf("server %v 收到了旧的leader% v 的心跳函数, args=%+v, 更新的term: %v\n", rf.me, args.LeaderId, args, reply.Term)
 		return
@@ -472,6 +509,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.state = Follower
+		rf.persist()
 	}
 
 	if len(args.Entries) == 0 {
@@ -481,26 +519,43 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// DPrintf("server %v 收到 leader %v 的的AppendEntries: %+v \n", rf.me, args.LeaderId, args)
 		DPrintf("server %v 收到 leader %v 的的AppendEntries\n", rf.me, args.LeaderId)
 	}
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		// PrevLogIndex和PrevLogTerm不合法
+
+	isConflict := false
+
+	if args.PrevLogIndex >= len(rf.log) {
+		// PrevLogIndex位置不存在日志项
+		reply.XTerm = -1
+		reply.XLen = len(rf.log)
+		isConflict = true
+		DPrintf("server %v 的log在PrevLogIndex: %v 位置不存在日志项, Log长度为%v\n", rf.me, args.PrevLogIndex, reply.XLen)
+	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		//PrevLogIndex位置的日志项存在, 但term不匹配
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		i := args.PrevLogIndex
+		for rf.log[i].Term == reply.XTerm {
+			i -= 1
+		}
+		reply.XIndex = i + 1
+		isConflict = true
+		DPrintf("server %v 的log在PrevLogIndex: %v 位置Term不匹配, args.Term=%v, 实际的term=%v\n", rf.me, args.PrevLogIndex, args.PrevLogTerm, reply.XTerm)
+	}
+
+	if isConflict {
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		reply.Success = false
-		DPrintf("server %v 检查到心跳中参数不合法:\n\t args.PrevLogIndex=%v, args.PrevLogTerm=%v, \n\tlen(self.log)=%v, self最后一个位置term为:%v\n", rf.me, args.PrevLogIndex, args.PrevLogTerm, len(rf.log), rf.log[len(rf.log)-1].Term)
 		return
 	}
 
 	// 3. If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
-	if len(args.Entries) != 0 && len(rf.log) > args.PrevLogIndex+1 && rf.log[args.PrevLogIndex+1].Term != args.Entries[0].Term {
-		// 发生了冲突, 移除冲突位置开始后面所有的内容
-		DPrintf("server %v 的log与args发生冲突, 进行移除\n", rf.me)
+	if len(args.Entries) != 0 && len(rf.log) > args.PrevLogIndex+1 {
 		rf.log = rf.log[:args.PrevLogIndex+1]
 	}
 
 	// append逻辑
 	rf.log = append(rf.log, args.Entries...)
+	rf.persist()
 	if len(args.Entries) != 0 {
 		DPrintf("server %v 成功进行apeend\n", rf.me)
 	}
@@ -513,8 +568,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
 		rf.applyCond.Signal() // 通知可能有新的日志需要应用
 	}
-
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
@@ -526,11 +579,11 @@ func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
 	}
 
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	if sendArgs.Term != rf.currentTerm {
 		// 在函数调用的间隙Leader诞生了
 		// 要先判断term是否改变, 否则后续的更改matchIndex等是不安全的
-		rf.mu.Unlock()
 		return
 	}
 
@@ -562,7 +615,6 @@ func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
 		rf.commitIndex = n
 		rf.applyCond.Signal() // 通知可能有新的日志需要应用
 		DPrintf("server %v 的提交索引被设置为 %v", rf.me, rf.commitIndex)
-		rf.mu.Unlock()
 		return
 	}
 
@@ -573,15 +625,33 @@ func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
 		rf.state = Follower
 		rf.votedFor = -1
 		rf.ResetTimer()
-		rf.mu.Unlock()
+		rf.persist()
 		return
 	}
 
 	if reply.Term == rf.currentTerm && rf.state == Leader {
 		// term仍然相同, 且自己还是leader, 表名对应的follower在prevLogIndex位置没有与prevLogTerm匹配的项
 		// 将nextIndex自减再重试
-		rf.nextIndex[serverTo] -= 1
-		rf.mu.Unlock()
+		if reply.XTerm == -1 {
+			// Follower中在PrevLogIndex位置不存在日志
+			DPrintf("leader %v 收到 server %v 的回退请求, 原因是log过短, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, serverTo, rf.nextIndex[serverTo], serverTo, reply.XLen)
+			rf.nextIndex[serverTo] = reply.XLen
+			return
+		}
+		i := rf.nextIndex[serverTo] - 1
+
+		for i > 0 && rf.log[i].Term > reply.Term {
+			i -= 1
+		}
+		if rf.log[i].Term == reply.XTerm {
+			// PrevLogIndex发生冲突时，该日志在leader中也有
+			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的最后一个XTerm索引为%v, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, i, serverTo, rf.nextIndex[serverTo], serverTo, i+1)
+			rf.nextIndex[serverTo] = i + 1
+		} else {
+			// PrevLogIndex发生冲突时，该日志在leader中没有
+			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的XTerm不存在, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, serverTo, rf.nextIndex[serverTo], serverTo, reply.XIndex)
+			rf.nextIndex[serverTo] = reply.XIndex
+		}
 		return
 	}
 }
@@ -605,12 +675,11 @@ func (rf *Raft) sendHeartbeats() {
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
 				PrevLogIndex: rf.nextIndex[i] - 1,
-				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
 				LeaderCommit: rf.commitIndex,
 			}
 			if len(rf.log)-1 >= rf.nextIndex[i] {
 				// 如果有新的log需要发送，则就是一个真正的AppendEntries而不是心跳
-				args.Entries = rf.log[rf.nextIndex[i]:]
+				args.Entries = rf.log[args.PrevLogIndex+1:]
 				// DPrintf("leader %v 开始向 server %v 广播新的AppendEntries: %+v\n", rf.me, i, args.Entries)
 				DPrintf("leader %v 开始向 server %v 广播新的AppendEntries\n", rf.me, i)
 			} else {
@@ -618,6 +687,7 @@ func (rf *Raft) sendHeartbeats() {
 				args.Entries = make([]Entry, 0)
 				DPrintf("leader %v 开始向 server %v 广播新的心跳, args = %+v \n", rf.me, i, args)
 			}
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 			go rf.handleHeartBeat(i, args)
 		}
 		rf.mu.Unlock()
@@ -661,7 +731,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.ResetTimer()
 
 	for i := 0; i < len(rf.nextIndex); i++ {
-		rf.nextIndex[i] = 1
+		rf.nextIndex[i] = len(rf.log)
 	}
 
 	// initialize from state persisted before a crash
