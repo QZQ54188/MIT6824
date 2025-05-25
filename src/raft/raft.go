@@ -97,6 +97,7 @@ type Raft struct {
 	snapShot          []byte        // 快照
 	lastIncludedIndex int           // 快照中包含的最后一条日志的索引
 	lastIncludedTerm  int           // 快照中包含的最后一条日志的任期号
+	heartTimer        *time.Timer
 }
 
 // return currentTerm and whether this server
@@ -478,6 +479,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	newEntry := &Entry{Term: rf.currentTerm, Cmd: command}
 	rf.log = append(rf.log, *newEntry)
 	rf.persist()
+
+	defer func() {
+		rf.ResetHeartTimer(1)
+	}()
+
 	return rf.VirtualLogIndex(len(rf.log) - 1), rf.currentTerm, true
 }
 
@@ -503,6 +509,10 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ResetTimer() {
 	rdTimeOut := GetRandomElectTimeOut(rf.rd)
 	rf.timer.Reset(time.Duration(rdTimeOut) * time.Millisecond)
+}
+
+func (rf *Raft) ResetHeartTimer(timeStamp int) {
+	rf.heartTimer.Reset(time.Duration(timeStamp) * time.Millisecond)
 }
 
 // 只可以在获取锁之后调用，访问节点中的日志时需要使用真实索引
@@ -541,27 +551,28 @@ func (rf *Raft) GetVoteAnswer(server int, args *RequestVoteArgs) bool {
 	return reply.VoteGranted
 }
 
-func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs) {
+func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs, muVote *sync.Mutex, voteCount *int) {
 	voteAnswer := rf.GetVoteAnswer(serverTo, args)
 	if !voteAnswer {
 		return
 	}
-	rf.muVote.Lock()
+	muVote.Lock()
 
-	if rf.voteCount > len(rf.peers)/2 {
+	if *voteCount > len(rf.peers)/2 {
 		// 已经获得半数票之后直接返回，防止其他线程进行不必要的操作
-		rf.muVote.Unlock()
+		muVote.Unlock()
 		return
 	}
 
-	rf.voteCount += 1
-	if rf.voteCount > len(rf.peers)/2 {
+	*voteCount += 1
+	if *voteCount > len(rf.peers)/2 {
 		rf.mu.Lock()
 
-		if rf.state == Follower {
+		if rf.state == Follower || rf.currentTerm != args.Term {
 			// 有另外一个投票的协程收到了更新的term而更改了自身状态为Follower
+			// 或者自己的term已经过期了
 			rf.mu.Unlock()
-			rf.muVote.Unlock()
+			muVote.Unlock()
 			return
 		}
 		rf.state = Leader
@@ -574,18 +585,19 @@ func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs) {
 		rf.mu.Unlock()
 		go rf.sendHeartbeats()
 	}
-	rf.muVote.Unlock()
+	muVote.Unlock()
 }
 
 func (rf *Raft) Elect() {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	rf.currentTerm += 1  // 自增term
 	rf.state = Candidate // 成为候选人
 	rf.votedFor = rf.me  // 给自己投票
-	rf.voteCount = 1     // 自己有一票
+	voteCount := 1       // 自己有一票
+	var muVote sync.Mutex
 	rf.persist()
-	// rf.timeStamp = time.Now() // 自己给自己投票也算一种消息
 
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -593,13 +605,12 @@ func (rf *Raft) Elect() {
 		LastLogIndex: rf.VirtualLogIndex(len(rf.log) - 1),
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
-	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		go rf.collectVote(i, args)
+		go rf.collectVote(i, args, &muVote, &voteCount)
 	}
 }
 
@@ -885,6 +896,7 @@ func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
 func (rf *Raft) sendHeartbeats() {
 	DPrintf("server %v 开始发送心跳\n", rf.me)
 	for !rf.killed() {
+		<-rf.heartTimer.C
 		rf.mu.Lock()
 		// 只要Leader才可以向其他raft节点发送心跳
 		if rf.state != Leader {
@@ -926,7 +938,7 @@ func (rf *Raft) sendHeartbeats() {
 			}
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(HeartBeatTimeOut) * time.Millisecond)
+		rf.ResetHeartTimer(HeartBeatTimeOut)
 	}
 }
 
@@ -963,6 +975,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCond = sync.NewCond(&rf.mu) // 初始化条件变量，关联到rf.mu锁
 	rf.rd = rand.New(rand.NewSource(int64(rf.me)))
 	rf.timer = time.NewTimer(0)
+	rf.heartTimer = time.NewTimer(0)
 	rf.ResetTimer()
 
 	for i := 0; i < len(rf.nextIndex); i++ {
