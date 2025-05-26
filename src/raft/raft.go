@@ -481,7 +481,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 
 	defer func() {
-		rf.ResetHeartTimer(1)
+		rf.ResetHeartTimer(15)
 	}()
 
 	return rf.VirtualLogIndex(len(rf.log) - 1), rf.currentTerm, true
@@ -856,7 +856,8 @@ func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
 			DPrintf("leader %v 收到 server %v 的回退请求, 原因是log过短, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, serverTo, rf.nextIndex[serverTo], serverTo, reply.XLen)
 			if rf.lastIncludedIndex >= reply.XLen {
 				// 由于Snapshot被截断，Leader应该发送快照
-				go rf.handleInstallSnapshot(serverTo)
+				// go rf.handleInstallSnapshot(serverTo)
+				rf.nextIndex[serverTo] = rf.lastIncludedIndex
 			} else {
 				rf.nextIndex[serverTo] = reply.XLen
 			}
@@ -873,7 +874,8 @@ func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
 
 		if i == rf.lastIncludedIndex && rf.log[rf.RealLogIndex(i)].Term > reply.XTerm {
 			// 要找的日志已经被截断，必须发送快照
-			go rf.handleInstallSnapshot(serverTo)
+			// go rf.handleInstallSnapshot(serverTo)
+			rf.nextIndex[serverTo] = rf.lastIncludedIndex
 		} else if rf.log[rf.RealLogIndex(i)].Term == reply.XTerm {
 			// 之前PrevLogIndex发生冲突位置时, Follower的Term自己也有
 			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的最后一个XTerm索引为%v, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, i, serverTo, rf.nextIndex[serverTo], serverTo, i+1)
@@ -883,7 +885,8 @@ func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
 			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的XTerm不存在, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, serverTo, rf.nextIndex[serverTo], serverTo, reply.XIndex)
 			if reply.XIndex <= rf.lastIncludedIndex {
 				// XIndex位置也被截断了
-				go rf.handleInstallSnapshot(serverTo)
+				// go rf.handleInstallSnapshot(serverTo)
+				rf.nextIndex[serverTo] = rf.lastIncludedIndex
 			} else {
 				rf.nextIndex[serverTo] = reply.XIndex
 			}
